@@ -125,8 +125,6 @@ async def classify_and_handle_update(
                 "Regenerating draft for pending tweet %d (richer source)",
                 pending.id,
             )
-            # TODO: regenerate draft and update Telegram message
-            # For now, mark for regeneration
             from src.drafting import load_style_guide, _build_system_prompt, _build_user_prompt
 
             style_guide = load_style_guide()
@@ -139,7 +137,6 @@ async def classify_and_handle_update(
                 if len(new_draft) <= 280:
                     update_tweet_draft(conn, pending.id, new_draft)
                     logger.info("Updated draft for tweet %d", pending.id)
-                    # TODO: update Telegram message via telegram_bot
                 else:
                     logger.warning("Regenerated draft too long (%d chars)", len(new_draft))
             except Exception as e:
@@ -151,7 +148,6 @@ async def classify_and_handle_update(
         tweet_id = await draft_tweet_for_story(llm, story_id, tweet_type="follow_up")
         if tweet_id:
             logger.info("Created follow-up tweet %d for story %d", tweet_id, story_id)
-            # TODO: send follow-up notification via telegram_bot
         return classification
 
     conn.close()

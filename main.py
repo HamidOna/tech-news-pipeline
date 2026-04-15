@@ -12,11 +12,12 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from src.clustering import ClusteringResult, cluster_articles
-from src.db import get_connection, init_db, mark_stale_stories
+from src.clustering import cluster_articles
+from src.db import Article, get_connection, init_db, mark_stale_stories
 from src.drafting import draft_tweet_for_story
 from src.ingestion import ingest_feeds
 from src.llm_client import LLMClient, LLMConfig
+from src.telegram_bot import send_draft_for_approval, update_draft_message
 from src.updates import classify_and_handle_update
 
 SETTINGS_PATH = Path(__file__).resolve().parent / "config" / "settings.yaml"
@@ -86,7 +87,9 @@ async def run_pipeline() -> None:
     # Mark stale stories
     pipeline_cfg = settings.get("pipeline", {})
     stale_hours = pipeline_cfg.get("stale_after_hours", 72)
-    stale_count = mark_stale_stories(get_connection(), stale_hours)
+    conn = get_connection()
+    stale_count = mark_stale_stories(conn, stale_hours)
+    conn.close()
     if stale_count:
         logger.info("Marked %d stories as stale", stale_count)
 
@@ -105,34 +108,67 @@ async def run_pipeline() -> None:
     cluster_window = pipeline_cfg.get("cluster_window_hours", 48)
     results = await cluster_articles(llm, cluster_window_hours=cluster_window)
 
-    # Step 3: Draft tweets for new stories
+    # Step 3: Draft tweets for new stories and send to Telegram
     logger.info("--- Step 3: Drafting ---")
     new_stories = [r for r in results if r.is_new_story]
     for result in new_stories:
         tweet_id = await draft_tweet_for_story(llm, result.story_id)
         if tweet_id:
             logger.info("Draft created: tweet %d for story %d", tweet_id, result.story_id)
-            # TODO: send draft to Telegram for approval
+            msg_id = await send_draft_for_approval(tweet_id)
+            if msg_id:
+                logger.info("Sent draft %d to Telegram (msg %d)", tweet_id, msg_id)
 
     # Step 4: Handle updates for matched stories
     logger.info("--- Step 4: Update detection ---")
     matched = [r for r in results if not r.is_new_story]
     conn = get_connection()
     for result in matched:
-        # Fetch the article to pass to classifier
         row = conn.execute(
             "SELECT id, url, title, summary, source_name, story_id, is_best_source, fetched_at "
             "FROM articles WHERE id = ?",
             (result.article_id,),
         ).fetchone()
         if row:
-            from src.db import Article
             article = Article(**dict(row))
             classification = await classify_and_handle_update(llm, article, result.story_id)
             logger.info(
                 "Article %d update type: %s", result.article_id, classification,
             )
+
+            if classification == "richer_source":
+                # Draft was regenerated in updates.py — update the Telegram message
+                from src.db import get_pending_tweet_for_story
+                pending = get_pending_tweet_for_story(conn, result.story_id)
+                if pending and pending.telegram_message_id:
+                    await update_draft_message(pending.id)
+                    logger.info("Updated Telegram message for tweet %d", pending.id)
+
+            elif classification == "genuine_update":
+                # A follow-up tweet was drafted in updates.py — find and send it
+                follow_up = conn.execute(
+                    "SELECT id FROM tweets WHERE story_id = ? AND tweet_type = 'follow_up' "
+                    "AND status = 'pending' AND telegram_message_id IS NULL "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (result.story_id,),
+                ).fetchone()
+                if follow_up:
+                    msg_id = await send_draft_for_approval(follow_up["id"])
+                    if msg_id:
+                        logger.info("Sent follow-up draft %d to Telegram", follow_up["id"])
     conn.close()
+
+    # Step 5: Send any unsent pending drafts (catch-all)
+    logger.info("--- Step 5: Send unsent drafts ---")
+    conn = get_connection()
+    unsent = conn.execute(
+        "SELECT id FROM tweets WHERE status = 'pending' AND telegram_message_id IS NULL"
+    ).fetchall()
+    conn.close()
+    for row in unsent:
+        msg_id = await send_draft_for_approval(row["id"])
+        if msg_id:
+            logger.info("Sent unsent draft %d to Telegram (msg %d)", row["id"], msg_id)
 
     logger.info("=== Pipeline run complete ===")
 
