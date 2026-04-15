@@ -5,6 +5,9 @@ pipeline:
   # How far back to look for existing story clusters (hours)
   cluster_window_hours: 48
 
+  # Max tweet drafts to generate per pipeline run (backlog clears over multiple runs)
+  max_drafts_per_run: 10
+
   # Mark stories as stale after this many hours
   stale_after_hours: 72
 

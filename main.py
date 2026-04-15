@@ -108,16 +108,31 @@ async def run_pipeline() -> None:
     cluster_window = pipeline_cfg.get("cluster_window_hours", 48)
     results = await cluster_articles(llm, cluster_window_hours=cluster_window)
 
-    # Step 3: Draft tweets for new stories and send to Telegram
+    # Step 3: Draft tweets for undrafted stories (backlog-aware, capped)
     logger.info("--- Step 3: Drafting ---")
-    new_stories = [r for r in results if r.is_new_story]
-    for result in new_stories:
-        tweet_id = await draft_tweet_for_story(llm, result.story_id)
+    cap = pipeline_cfg.get("max_drafts_per_run", 10)
+    conn = get_connection()
+    undrafted = conn.execute(
+        "SELECT s.id FROM stories s "
+        "LEFT JOIN tweets t ON s.id = t.story_id "
+        "WHERE t.id IS NULL AND s.status = 'active' "
+        "ORDER BY s.created_at ASC"
+    ).fetchall()
+    conn.close()
+    total_undrafted = len(undrafted)
+    logger.info("Found %d undrafted stories", total_undrafted)
+
+    to_draft = undrafted[:cap]
+    remaining = total_undrafted - len(to_draft)
+    if remaining > 0:
+        logger.info("Drafting %d this run (cap: %d), %d deferred to next run", len(to_draft), cap, remaining)
+    elif to_draft:
+        logger.info("Drafting %d this run (cap: %d)", len(to_draft), cap)
+
+    for row in to_draft:
+        tweet_id = await draft_tweet_for_story(llm, row["id"])
         if tweet_id:
-            logger.info("Draft created: tweet %d for story %d", tweet_id, result.story_id)
-            msg_id = await send_draft_for_approval(tweet_id)
-            if msg_id:
-                logger.info("Sent draft %d to Telegram (msg %d)", tweet_id, msg_id)
+            logger.info("Draft created: tweet %d for story %d", tweet_id, row["id"])
 
     # Step 4: Handle updates for matched stories
     logger.info("--- Step 4: Update detection ---")
@@ -158,17 +173,28 @@ async def run_pipeline() -> None:
                         logger.info("Sent follow-up draft %d to Telegram", follow_up["id"])
     conn.close()
 
-    # Step 5: Send any unsent pending drafts (catch-all)
-    logger.info("--- Step 5: Send unsent drafts ---")
+    # Step 5: Send unsent pending drafts to Telegram (capped)
+    logger.info("--- Step 5: Telegram notifications ---")
     conn = get_connection()
+    total_unsent = conn.execute(
+        "SELECT COUNT(*) as c FROM tweets WHERE status = 'pending' AND telegram_message_id IS NULL"
+    ).fetchone()["c"]
     unsent = conn.execute(
-        "SELECT id FROM tweets WHERE status = 'pending' AND telegram_message_id IS NULL"
+        "SELECT id FROM tweets "
+        "WHERE status = 'pending' AND telegram_message_id IS NULL "
+        "ORDER BY created_at ASC LIMIT ?",
+        (cap,),
     ).fetchall()
     conn.close()
+    unsent_remaining = total_unsent - len(unsent)
+    logger.info(
+        "Sending %d drafts to Telegram (%d unsent drafts queued for next run)",
+        len(unsent), unsent_remaining,
+    )
     for row in unsent:
         msg_id = await send_draft_for_approval(row["id"])
         if msg_id:
-            logger.info("Sent unsent draft %d to Telegram (msg %d)", row["id"], msg_id)
+            logger.info("Sent draft %d to Telegram (msg %d)", row["id"], msg_id)
 
     logger.info("=== Pipeline run complete ===")
 

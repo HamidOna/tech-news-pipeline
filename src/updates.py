@@ -125,22 +125,12 @@ async def classify_and_handle_update(
                 "Regenerating draft for pending tweet %d (richer source)",
                 pending.id,
             )
-            from src.drafting import load_style_guide, _build_system_prompt, _build_user_prompt
-
-            style_guide = load_style_guide()
-            system_prompt = _build_system_prompt(style_guide)
-            user_prompt = _build_user_prompt(
-                article.title, article.summary, article.source_name,
-            )
-            try:
-                new_draft = await llm.complete(system_prompt, user_prompt)
-                if len(new_draft) <= 280:
-                    update_tweet_draft(conn, pending.id, new_draft)
-                    logger.info("Updated draft for tweet %d", pending.id)
-                else:
-                    logger.warning("Regenerated draft too long (%d chars)", len(new_draft))
-            except Exception as e:
-                logger.error("Failed to regenerate draft: %s", e)
+            from src.drafting import regenerate_draft
+            new_draft = await regenerate_draft(llm, pending.id)
+            if new_draft:
+                logger.info("Updated draft for tweet %d", pending.id)
+            else:
+                logger.warning("Failed to regenerate draft for tweet %d", pending.id)
 
     elif classification == "genuine_update":
         # Draft a follow-up tweet
