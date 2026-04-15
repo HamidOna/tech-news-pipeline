@@ -1,0 +1,7 @@
+feedparser
+tweepy
+python-telegram-bot
+groq
+google-generativeai
+pyyaml
+python-dotenv

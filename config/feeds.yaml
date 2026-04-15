@@ -1,0 +1,24 @@
+feeds:
+  - name: "The Verge"
+    url: "https://www.theverge.com/rss/index.xml"
+
+  - name: "Ars Technica"
+    url: "https://feeds.arstechnica.com/arstechnica/index"
+
+  - name: "GSMArena"
+    url: "https://www.gsmarena.com/rss-news-reviews.php3"
+
+  - name: "Engadget"
+    url: "https://www.engadget.com/rss.xml"
+
+  - name: "Tom's Hardware"
+    url: "https://www.tomshardware.com/feeds/all"
+
+  - name: "Reddit r/Android"
+    url: "https://www.reddit.com/r/Android/hot.rss"
+
+  - name: "Reddit r/gadgets"
+    url: "https://www.reddit.com/r/gadgets/hot.rss"
+
+  - name: "Reddit r/hardware"
+    url: "https://www.reddit.com/r/hardware/hot.rss"

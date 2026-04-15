@@ -1,0 +1,43 @@
+pipeline:
+  # How often the cron job runs (minutes)
+  cron_interval_minutes: 30
+
+  # How far back to look for existing story clusters (hours)
+  cluster_window_hours: 48
+
+  # Mark stories as stale after this many hours
+  stale_after_hours: 72
+
+llm:
+  # Primary provider
+  primary_provider: "groq"
+  primary_model: "llama-3.3-70b-versatile"
+
+  # Fallback provider
+  fallback_provider: "gemini"
+  fallback_model: "gemini-2.0-flash"
+
+  # Retry settings
+  max_retries: 3
+  retry_base_delay_seconds: 2
+
+  # Generation params
+  temperature: 0.7
+  max_tokens: 512
+
+twitter:
+  # Tweet character limit
+  max_tweet_length: 280
+
+  # Rate limit: max tweets per 15-minute window (free tier)
+  rate_limit_per_window: 50
+
+telegram:
+  # Polling timeout for bot (seconds)
+  poll_timeout: 30
+
+logging:
+  level: "INFO"
+  # Rotating log file max size (bytes) — 5 MB
+  max_bytes: 5242880
+  backup_count: 3

@@ -1,0 +1,153 @@
+"""Pipeline orchestrator: ingestion -> clustering -> drafting -> updates -> notifications.
+
+Entry point for cron. Runs once per invocation.
+"""
+
+import asyncio
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import yaml
+from dotenv import load_dotenv
+
+from src.clustering import ClusteringResult, cluster_articles
+from src.db import get_connection, init_db, mark_stale_stories
+from src.drafting import draft_tweet_for_story
+from src.ingestion import ingest_feeds
+from src.llm_client import LLMClient, LLMConfig
+from src.updates import classify_and_handle_update
+
+SETTINGS_PATH = Path(__file__).resolve().parent / "config" / "settings.yaml"
+
+
+def load_settings() -> dict:
+    """Load pipeline settings from config/settings.yaml."""
+    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def setup_logging(settings: dict) -> None:
+    """Configure logging to stdout and a rotating file."""
+    log_cfg = settings.get("logging", {})
+    level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Stdout
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+
+    # Rotating file
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_dir / "pipeline.log",
+        maxBytes=log_cfg.get("max_bytes", 5_242_880),
+        backupCount=log_cfg.get("backup_count", 3),
+    )
+    file_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+
+def build_llm_config(settings: dict) -> LLMConfig:
+    """Build LLMConfig from settings."""
+    llm_cfg = settings.get("llm", {})
+    return LLMConfig(
+        primary_model=llm_cfg.get("primary_model", "llama-3.3-70b-versatile"),
+        fallback_model=llm_cfg.get("fallback_model", "gemini-2.0-flash"),
+        max_retries=llm_cfg.get("max_retries", 3),
+        retry_base_delay=llm_cfg.get("retry_base_delay_seconds", 2.0),
+        temperature=llm_cfg.get("temperature", 0.7),
+        max_tokens=llm_cfg.get("max_tokens", 512),
+    )
+
+
+async def run_pipeline() -> None:
+    """Execute the full pipeline once."""
+    logger = logging.getLogger(__name__)
+
+    # Load settings
+    settings = load_settings()
+    setup_logging(settings)
+    logger.info("=== Pipeline run starting ===")
+
+    # Init DB
+    init_db()
+
+    # Mark stale stories
+    pipeline_cfg = settings.get("pipeline", {})
+    stale_hours = pipeline_cfg.get("stale_after_hours", 72)
+    stale_count = mark_stale_stories(get_connection(), stale_hours)
+    if stale_count:
+        logger.info("Marked %d stories as stale", stale_count)
+
+    # Step 1: Ingest RSS feeds
+    logger.info("--- Step 1: Ingestion ---")
+    new_article_ids = await ingest_feeds()
+    logger.info("Ingested %d new articles", len(new_article_ids))
+
+    if not new_article_ids:
+        logger.info("No new articles. Pipeline complete.")
+        return
+
+    # Step 2: Cluster articles
+    logger.info("--- Step 2: Clustering ---")
+    llm = LLMClient(build_llm_config(settings))
+    cluster_window = pipeline_cfg.get("cluster_window_hours", 48)
+    results = await cluster_articles(llm, cluster_window_hours=cluster_window)
+
+    # Step 3: Draft tweets for new stories
+    logger.info("--- Step 3: Drafting ---")
+    new_stories = [r for r in results if r.is_new_story]
+    for result in new_stories:
+        tweet_id = await draft_tweet_for_story(llm, result.story_id)
+        if tweet_id:
+            logger.info("Draft created: tweet %d for story %d", tweet_id, result.story_id)
+            # TODO: send draft to Telegram for approval
+
+    # Step 4: Handle updates for matched stories
+    logger.info("--- Step 4: Update detection ---")
+    matched = [r for r in results if not r.is_new_story]
+    conn = get_connection()
+    for result in matched:
+        # Fetch the article to pass to classifier
+        row = conn.execute(
+            "SELECT id, url, title, summary, source_name, story_id, is_best_source, fetched_at "
+            "FROM articles WHERE id = ?",
+            (result.article_id,),
+        ).fetchone()
+        if row:
+            from src.db import Article
+            article = Article(**dict(row))
+            classification = await classify_and_handle_update(llm, article, result.story_id)
+            logger.info(
+                "Article %d update type: %s", result.article_id, classification,
+            )
+    conn.close()
+
+    logger.info("=== Pipeline run complete ===")
+
+
+def main() -> None:
+    """Entry point."""
+    load_dotenv()
+    try:
+        asyncio.run(run_pipeline())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logging.getLogger(__name__).exception("Pipeline failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
